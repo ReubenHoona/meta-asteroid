@@ -1,0 +1,149 @@
+From 592657346e7b6aad862b9857ca4f0b40904e1bae Mon Sep 17 00:00:00 2001
+From: Reuben Horner <reubarb.scons@gmail.com>
+Date: Wed, 21 Oct 2026 09:07:54 +0000
+Subject: [PATCH] Make oFono optional (CONFIG+=no_ofono)
+
+oFono and oFono-ext are only used to find the APN of the cellular data
+connection for online aGPS. AsteroidOS does not ship qofono-qt6 or
+qofonoext, so with CONFIG+=no_ofono those lookups are compiled out and a
+request for a cellular data connection is answered with
+aGnssDataConnFailed(); standalone GNSS and Wi-Fi based aGPS (XTRA, NTP)
+are unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ geoclue-providers-hybris.pri |  7 ++++++-
+ hybrisprovider.cpp           | 27 ++++++++++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/geoclue-providers-hybris.pri b/geoclue-providers-hybris.pri
+index f8f0aca..fa9fd5e 100644
+--- a/geoclue-providers-hybris.pri
++++ b/geoclue-providers-hybris.pri
+@@ -8,7 +8,12 @@ target.path = /usr/libexec
+ QT = core dbus network
+ 
+ CONFIG += link_pkgconfig
+-PKGCONFIG += connman-qt6 qofono-qt6 qofonoext-qt6
++PKGCONFIG += connman-qt6
++no_ofono {
++    DEFINES += HYBRIS_NO_OFONO
++} else {
++    PKGCONFIG += qofono-qt6 qofonoext-qt6
++}
+ 
+ LIBS += -lrt
+ 
+diff --git a/hybrisprovider.cpp b/hybrisprovider.cpp
+index 86670aa..09f780c 100644
+--- a/hybrisprovider.cpp
++++ b/hybrisprovider.cpp
+@@ -30,11 +30,13 @@
+ 
+ #include <networkservice.h>
+ 
++#ifndef HYBRIS_NO_OFONO
+ #include <qofonomanager.h>
+ #include <qofonoconnectionmanager.h>
+ #include <qofonoconnectioncontext.h>
+ 
+ #include <qofonoextmodemmanager.h>
++#endif
+ 
+ #include <strings.h>
+ #include <sys/time.h>
+@@ -151,8 +153,13 @@ HybrisProvider::HybrisProvider(QObject *parent)
+     m_status(StatusUnavailable), m_positionInjectionConnected(false), m_xtraDownloadReply(Q_NULLPTR), m_xtraServerIndex(0),
+     m_requestedConnect(false), m_gpsStarted(false),
+     m_networkManager(new NetworkManager(this)), m_cellularTechnology(Q_NULLPTR),
++#ifndef HYBRIS_NO_OFONO
+     m_ofonoExtModemManager(new QOfonoExtModemManager(this)),
+-    m_connectionManager(new QOfonoConnectionManager(this)), m_connectionContext(Q_NULLPTR), m_ntpSocket(Q_NULLPTR),
++    m_connectionManager(new QOfonoConnectionManager(this)),
++#else
++    m_ofonoExtModemManager(Q_NULLPTR), m_connectionManager(Q_NULLPTR),
++#endif
++    m_connectionContext(Q_NULLPTR), m_ntpSocket(Q_NULLPTR),
+     m_agpsEnabled(false), m_agpsOnlineEnabled(false), m_useForcedNtpInject(false), m_useForcedXtraInject(false),
+     m_suplPort(0)
+ {
+@@ -179,6 +186,7 @@ HybrisProvider::HybrisProvider(QObject *parent)
+ 
+     technologiesChanged();
+ 
++#ifndef HYBRIS_NO_OFONO
+     connect(m_ofonoExtModemManager, SIGNAL(defaultDataModemChanged(QString)),
+             this, SLOT(defaultDataModemChanged(QString)));
+ 
+@@ -186,6 +194,7 @@ HybrisProvider::HybrisProvider(QObject *parent)
+             this, SLOT(connectionManagerValidChanged()));
+ 
+     defaultDataModemChanged(m_ofonoExtModemManager->defaultDataModem());
++#endif
+ 
+     QDBusConnection connection = QDBusConnection::sessionBus();
+ 
+@@ -912,7 +921,9 @@ void HybrisProvider::defaultDataModemChanged(const QString &modem)
+ {
+     qCDebug(lcGeoclueHybris) << "Default data modem changed to" << modem;
+ 
++#ifndef HYBRIS_NO_OFONO
+     m_connectionManager->setModemPath(modem);
++#endif
+ }
+ 
+ void HybrisProvider::connectionManagerValidChanged()
+@@ -925,6 +936,7 @@ void HybrisProvider::connectionManagerValidChanged()
+ 
+ void HybrisProvider::connectionContextValidChanged()
+ {
++#ifndef HYBRIS_NO_OFONO
+     qCDebug(lcGeoclueHybris) << "Connection context valid changed";
+ 
+     if (!m_agpsOnlineEnabled)
+@@ -945,6 +957,7 @@ void HybrisProvider::connectionContextValidChanged()
+     } else {
+         processNextConnectionContext();
+     }
++#endif
+ }
+ 
+ void HybrisProvider::cellularConnected(bool connected)
+@@ -1199,6 +1212,11 @@ void HybrisProvider::sendNtpRequest()
+ 
+ void HybrisProvider::processConnectionContexts()
+ {
++#ifdef HYBRIS_NO_OFONO
++    qWarning("Built without oFono: no cellular data connection for aGPS.");
++    m_agpsInterface.clear();
++    m_backend->aGnssDataConnFailed();
++#else
+     if (!m_connectionManager->isValid()) {
+         qCDebug(lcGeoclueHybris) << "Connection manager is not yet valid.";
+         return;
+@@ -1206,10 +1224,16 @@ void HybrisProvider::processConnectionContexts()
+ 
+     m_connectionContexts = m_connectionManager->contexts();
+     processNextConnectionContext();
++#endif
+ }
+ 
+ void HybrisProvider::processNextConnectionContext()
+ {
++#ifdef HYBRIS_NO_OFONO
++    qWarning("Built without oFono: no cellular data connection for aGPS.");
++    m_agpsInterface.clear();
++    m_backend->aGnssDataConnFailed();
++#else
+     qCDebug(lcGeoclueHybris) << "Remaining connection contexts to check:" << m_connectionContexts;
+ 
+     if (m_connectionContexts.isEmpty()) {
+@@ -1233,4 +1257,5 @@ void HybrisProvider::processNextConnectionContext()
+     const QString contextPath = m_connectionContexts.takeFirst();
+     qCDebug(lcGeoclueHybris) << "Getting APN for" << contextPath;
+     m_connectionContext->setContextPath(contextPath);
++#endif
+ }
+-- 
+2.51.0
+
