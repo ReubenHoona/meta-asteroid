@@ -1,0 +1,311 @@
+From c8d384f593e62bd14a63576f6f91111264184915 Mon Sep 17 00:00:00 2001
+From: Reuben Horner <reubarb.scons@gmail.com>
+Date: Thu, 22 Oct 2026 10:40:34 +1300
+Subject: [PATCH] aidl: Fix location and PSDS injection, request NMEA, report
+ the network
+
+Fixes for the AIDL GNSS backend, found on an Android 13 Qualcomm HAL:
+
+- injectLocation() wrote six floats after the latitude, longitude and
+  altitude, but every GnssLocation field there is a double, followed by
+  timestampMillis and an ElapsedRealtime. Write the parcelable as
+  defined, with the timestamp in milliseconds.
+- XTRA data was injected as PSDS type 0, which does not exist; it is
+  PsdsType.LONG_TERM (1).
+- IGnss V2 only reports NMEA after startNmea(). Call it after starting
+  positioning and stopNmea() when stopping; a V1 HAL rejects the call,
+  which is not fatal.
+- gnssStart() and gnssStop() leaked the replies of all but the last
+  transaction. Release each one, and check that start() succeeded.
+- Tell the HAL whether a data network is up and whether it is unmetered
+  through IAGnssRil.updateNetworkState(), at start-up and when connman's
+  state or default route changes. Qualcomm's XTRA client only downloads
+  assistance data when the HAL reports a connection. Other backends keep
+  a no-op default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Bjcm5NyXPk9Dun3FP3X9LN
+---
+ binder/binderlocationbackend_aidl.cpp | 110 ++++++++++++++++++++++----
+ binder/binderlocationbackend_aidl.h   |   1 +
+ hybrislocationbackend.h               |   8 ++
+ hybrisprovider.cpp                    |  21 +++++
+ hybrisprovider.h                      |   1 +
+ 5 files changed, 124 insertions(+), 17 deletions(-)
+
+diff --git a/binder/binderlocationbackend_aidl.cpp b/binder/binderlocationbackend_aidl.cpp
+index ba6b694..398ddf7 100644
+--- a/binder/binderlocationbackend_aidl.cpp
++++ b/binder/binderlocationbackend_aidl.cpp
+@@ -17,6 +17,8 @@
+ 
+ #include <QtNetwork/QHostAddress>
+ 
++#include <time.h>
++
+ #define GNSS_BINDER_DEFAULT_DEV  "/dev/binder"
+ 
+ enum GnssAidlFunctions {
+@@ -103,6 +105,11 @@ enum AGnssAidlRilFunctions {
+     AGNSS_AIDL_RIL_INJECT_NI_SUPL_MESSAGE_DATA = 5
+ };
+ 
++enum AGnssAidlRilNetworkCapabilities {
++    AGNSS_AIDL_RIL_NETWORK_CAPABILITY_NOT_METERED = 0x01,
++    AGNSS_AIDL_RIL_NETWORK_CAPABILITY_NOT_ROAMING = 0x02
++};
++
+ enum AGnssAidlRilCallbacks {
+     AGNSS_AIDL_RIL_REQUEST_SET_ID_CB = 1,
+     AGNSS_AIDL_RIL_REQUEST_REF_LOC_CB = 2
+@@ -570,15 +577,23 @@ bool BinderLocationBackendAidl::gnssStart()
+ 
+         reply = gbinder_client_transact_sync_reply(m_clientGnss,
+             GNSS_AIDL_START, Q_NULLPTR, &status);
++        ret = !status && isReplySuccess(reply);
++        gbinder_remote_reply_unref(reply);
+ 
+-        reply = gbinder_client_transact_sync_reply(m_clientGnss,
+-            GNSS_AIDL_START_SV_STATUS, Q_NULLPTR, &status);
+-
+-        if (!status && isReplySuccess(reply)) {
+-            ret = true;
++        if (ret) {
++            reply = gbinder_client_transact_sync_reply(m_clientGnss,
++                GNSS_AIDL_START_SV_STATUS, Q_NULLPTR, &status);
++            ret = !status && isReplySuccess(reply);
++            gbinder_remote_reply_unref(reply);
+         }
+ 
+-        gbinder_remote_reply_unref(reply);
++        if (ret) {
++            /* NMEA is only reported after startNmea() (IGnss V2); a V1 HAL
++             * rejects the call and reports no NMEA, which is not fatal */
++            reply = gbinder_client_transact_sync_reply(m_clientGnss,
++                GNSS_AIDL_START_NMEA, Q_NULLPTR, &status);
++            gbinder_remote_reply_unref(reply);
++        }
+     }
+ 
+     if (!ret) {
+@@ -595,8 +610,13 @@ bool BinderLocationBackendAidl::gnssStop()
+         int status = 0;
+         GBinderRemoteReply *reply;
+ 
++        reply = gbinder_client_transact_sync_reply(m_clientGnss,
++            GNSS_AIDL_STOP_NMEA, Q_NULLPTR, &status);
++        gbinder_remote_reply_unref(reply);
++
+         reply = gbinder_client_transact_sync_reply(m_clientGnss,
+             GNSS_AIDL_STOP_SV_STATUS, Q_NULLPTR, &status);
++        gbinder_remote_reply_unref(reply);
+ 
+         reply = gbinder_client_transact_sync_reply(m_clientGnss,
+             GNSS_AIDL_STOP, Q_NULLPTR, &status);
+@@ -639,25 +659,39 @@ bool BinderLocationBackendAidl::gnssInjectLocation(
+         req = gbinder_client_new_request(m_clientGnss);
+         gbinder_local_request_init_writer(req, &writer);
+ 
++        struct timespec now;
++        clock_gettime(CLOCK_BOOTTIME, &now);
++
+         /* Non-null parcelable */
+         gbinder_writer_append_int32(&writer, 1);
+-        /* Parcelable size */
++        /* Parcelable size, counting the size field itself: flags, nine
++         * doubles, timestampMillis and the ElapsedRealtime parcelable */
+         gbinder_writer_append_int32(&writer,
+-            sizeof(gint32) + 3 * sizeof(gdouble) + 6 * sizeof(gfloat));
++            2 * sizeof(gint32) + 9 * sizeof(gdouble) + sizeof(gint64)
++            + 3 * sizeof(gint32) + sizeof(gint64) + sizeof(gdouble));
+ 
+         gbinder_writer_append_int32(&writer,
+             HYBRIS_GNSS_LOCATION_HAS_LAT_LONG |
+             HYBRIS_GNSS_LOCATION_HAS_HORIZONTAL_ACCURACY);
+         gbinder_writer_append_double(&writer, latitudeDegrees);
+         gbinder_writer_append_double(&writer, longitudeDegrees);
+-        gbinder_writer_append_double(&writer, 0);
+-        gbinder_writer_append_float(&writer, 0);
+-        gbinder_writer_append_float(&writer, 0);
+-        gbinder_writer_append_float(&writer, accuracyMeters);
+-        gbinder_writer_append_float(&writer, 0);
+-        gbinder_writer_append_float(&writer, 0);
+-        gbinder_writer_append_float(&writer, 0);
+-        gbinder_writer_append_int64(&writer, timestamp);
++        gbinder_writer_append_double(&writer, 0);              /* altitudeMeters */
++        gbinder_writer_append_double(&writer, 0);              /* speedMetersPerSec */
++        gbinder_writer_append_double(&writer, 0);              /* bearingDegrees */
++        gbinder_writer_append_double(&writer, accuracyMeters); /* horizontalAccuracyMeters */
++        gbinder_writer_append_double(&writer, 0);              /* verticalAccuracyMeters */
++        gbinder_writer_append_double(&writer, 0);              /* speedAccuracyMetersPerSecond */
++        gbinder_writer_append_double(&writer, 0);              /* bearingAccuracyDegrees */
++        gbinder_writer_append_int64(&writer, (gint64)timestamp * 1000);
++
++        /* ElapsedRealtime: non-null marker, size, flags (timestamp and its
++         * uncertainty present), timestampNs, timeUncertaintyNs */
++        gbinder_writer_append_int32(&writer, 1);
++        gbinder_writer_append_int32(&writer,
++            2 * sizeof(gint32) + sizeof(gint64) + sizeof(gdouble));
++        gbinder_writer_append_int32(&writer, 0x3);
++        gbinder_writer_append_int64(&writer, (gint64)now.tv_sec * 1000000000LL + now.tv_nsec);
++        gbinder_writer_append_double(&writer, 1e9);
+ 
+         reply = gbinder_client_transact_sync_reply(m_clientGnss,
+             GNSS_AIDL_INJECT_LOCATION, req, &status);
+@@ -886,7 +920,8 @@ bool BinderLocationBackendAidl::gnssXtraInjectXtraData(QByteArray &xtraData)
+ 
+         GBinderWriter writer;
+         gbinder_local_request_init_writer(req, &writer);
+-        gbinder_writer_append_int32(&writer, 0);
++        /* PsdsType.LONG_TERM */
++        gbinder_writer_append_int32(&writer, 1);
+         gbinder_writer_append_byte_array(&writer, xtraData.data(), xtraData.length());
+         reply = gbinder_client_transact_sync_reply(m_clientGnssXtra,
+             GNSS_AIDL_PSDS_INJECT_PSDS_DATA, req, &status);
+@@ -1074,6 +1109,47 @@ void BinderLocationBackendAidl::aGnssRilInit()
+     gbinder_remote_reply_unref(reply);
+ }
+ 
++bool BinderLocationBackendAidl::aGnssRilUpdateNetworkState(bool connected, bool unmetered)
++{
++    bool ret = false;
++
++    if (m_clientAGnssRil) {
++        int status = 0;
++        GBinderLocalRequest *req;
++        GBinderRemoteReply *reply;
++        GBinderWriter writer;
++
++        req = gbinder_client_new_request(m_clientAGnssRil);
++        gbinder_local_request_init_writer(req, &writer);
++
++        /* NetworkAttributes { long networkHandle; boolean isConnected;
++         * int capabilities; String apn; }: non-null marker, then the size
++         * counting itself; the empty UTF-16 apn takes 8 bytes */
++        gbinder_writer_append_int32(&writer, 1);
++        gbinder_writer_append_int32(&writer,
++            sizeof(gint32) + sizeof(gint64) + 2 * sizeof(gint32) + 8);
++        /* There is no netd on the host, so any well-formed Android network
++         * handle will do: (netId << 32) | 0xcafed00d */
++        gbinder_writer_append_int64(&writer, ((gint64)100 << 32) | 0xcafed00dLL);
++        gbinder_writer_append_int32(&writer, connected);
++        gbinder_writer_append_int32(&writer,
++            AGNSS_AIDL_RIL_NETWORK_CAPABILITY_NOT_ROAMING |
++            (unmetered ? AGNSS_AIDL_RIL_NETWORK_CAPABILITY_NOT_METERED : 0));
++        gbinder_writer_append_string16(&writer, "");
++
++        reply = gbinder_client_transact_sync_reply(m_clientAGnssRil,
++            AGNSS_AIDL_RIL_UPDATE_NETWORK_STATE, req, &status);
++        ret = !status && isReplySuccess(reply);
++        if (!ret) {
++            qWarning("Failed to update the AGNSS RIL network state");
++        }
++
++        gbinder_local_request_unref(req);
++        gbinder_remote_reply_unref(reply);
++    }
++    return ret;
++}
++
+ bool BinderLocationBackendAidl::isReplySuccess(GBinderRemoteReply *reply)
+ {
+     GBinderReader reader;
+diff --git a/binder/binderlocationbackend_aidl.h b/binder/binderlocationbackend_aidl.h
+index ee54693..20dc7e1 100644
+--- a/binder/binderlocationbackend_aidl.h
++++ b/binder/binderlocationbackend_aidl.h
+@@ -63,6 +63,7 @@ public:
+ 
+     // AGnssRil
+     void aGnssRilInit();
++    bool aGnssRilUpdateNetworkState(bool connected, bool unmetered);
+ 
+ protected:
+     bool isReplySuccess(GBinderRemoteReply *reply);
+diff --git a/hybrislocationbackend.h b/hybrislocationbackend.h
+index 4ea8220..24b6463 100644
+--- a/hybrislocationbackend.h
++++ b/hybrislocationbackend.h
+@@ -142,6 +142,14 @@ public:
+ 
+     // AGnssRil
+     virtual void aGnssRilInit() = 0;
++    // Tell the GNSS HAL whether a data network is up and whether it is
++    // unmetered (e.g. Wi-Fi), so it can download assistance data.
++    virtual bool aGnssRilUpdateNetworkState(bool connected, bool unmetered)
++    {
++        Q_UNUSED(connected)
++        Q_UNUSED(unmetered)
++        return false;
++    }
+ 
+ };
+ 
+diff --git a/hybrisprovider.cpp b/hybrisprovider.cpp
+index 09f780c..681b713 100644
+--- a/hybrisprovider.cpp
++++ b/hybrisprovider.cpp
+@@ -183,6 +183,7 @@ HybrisProvider::HybrisProvider(QObject *parent)
+ 
+     connect(m_networkManager, &NetworkManager::technologiesChanged, this, &HybrisProvider::technologiesChanged);
+     connect(m_networkManager, &NetworkManager::globalStateChanged, this, &HybrisProvider::stateChanged);
++    connect(m_networkManager, &NetworkManager::defaultRouteChanged, this, &HybrisProvider::updateNetworkState);
+ 
+     technologiesChanged();
+ 
+@@ -264,6 +265,7 @@ HybrisProvider::HybrisProvider(QObject *parent)
+     m_backend->aGnssRilInit();
+     m_backend->gnssXtraInit();
+     m_backend->gnssDebugInit();
++    updateNetworkState();
+ 
+     // Set SUPL server if provided
+     if (!m_suplHost.isEmpty() && m_suplPort > 0) {
+@@ -907,6 +909,8 @@ void HybrisProvider::technologiesChanged()
+ 
+ void HybrisProvider::stateChanged(NetworkManager::State state)
+ {
++    updateNetworkState();
++
+     if (state == NetworkManager::OnlineState && m_gpsStarted) {
+         if (m_useForcedXtraInject) {
+             gnssXtraDownloadRequest();
+@@ -917,6 +921,23 @@ void HybrisProvider::stateChanged(NetworkManager::State state)
+     }
+ }
+ 
++void HybrisProvider::updateNetworkState()
++{
++    if (!m_backend)
++        return;
++
++    // connman reports "ready" when its online check fails even though the
++    // network works, so count that as connected too
++    const NetworkManager::State state = m_networkManager->globalState();
++    const bool connected = state == NetworkManager::OnlineState || state == NetworkManager::ReadyState;
++    NetworkService *service = m_networkManager->defaultRoute();
++    const bool unmetered = service && service->type() != QLatin1String("cellular");
++
++    qCDebug(lcGeoclueHybris) << "Network" << (connected ? "connected" : "not connected")
++                             << (unmetered ? "unmetered" : "metered");
++    m_backend->aGnssRilUpdateNetworkState(connected, connected && unmetered);
++}
++
+ void HybrisProvider::defaultDataModemChanged(const QString &modem)
+ {
+     qCDebug(lcGeoclueHybris) << "Default data modem changed to" << modem;
+diff --git a/hybrisprovider.h b/hybrisprovider.h
+index db5e957..9ff0609 100644
+--- a/hybrisprovider.h
++++ b/hybrisprovider.h
+@@ -145,6 +145,7 @@ private slots:
+ 
+     void technologiesChanged();
+     void stateChanged(NetworkManager::State state);
++    void updateNetworkState();
+     void defaultDataModemChanged(const QString &modem);
+     void connectionManagerValidChanged();
+     void connectionContextValidChanged();
+-- 
+2.45.2.windows.1
+
