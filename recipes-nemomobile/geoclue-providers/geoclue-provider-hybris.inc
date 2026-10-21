@@ -27,3 +27,12 @@ EXTRA_QMAKEVARS_PRE += "CONFIG+=no_ofono"
 B = "${S}"
 
 FILES:${PN} += "/usr/share/dbus-1 /usr/share/geoclue-providers /usr/lib/systemd/user"
+
+# See asteroid-no-sandbox.conf: the upstream user unit's sandboxing makes the
+# provider abort at start-up on AsteroidOS.
+SRC_URI += "file://asteroid-no-sandbox.conf"
+do_install:append() {
+    install -d ${D}/usr/lib/systemd/user/geoclue-providers-hybris.service.d
+    install -m 0644 ${UNPACKDIR}/asteroid-no-sandbox.conf \
+        ${D}/usr/lib/systemd/user/geoclue-providers-hybris.service.d/asteroid-no-sandbox.conf
+}
