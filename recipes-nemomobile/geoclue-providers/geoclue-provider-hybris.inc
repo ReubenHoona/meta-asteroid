@@ -11,6 +11,7 @@ SRC_URI = "git://github.com/mer-hybris/geoclue-providers-hybris.git;protocol=htt
     file://0005-backends-Qualify-stream-manipulators-with-Qt-for-Qt6.patch \
     file://0006-Make-oFono-optional-CONFIG-no_ofono.patch \
     file://0007-aidl-Fix-location-and-PSDS-injection-request-NMEA-report-the-network.patch \
+    file://0008-Wait-for-the-default-route-before-reporting-the-network-state.patch \
     "
 SRCREV = "0.2.40"
 PR = "r1"
